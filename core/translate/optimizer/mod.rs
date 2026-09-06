@@ -55,8 +55,8 @@ use crate::{
 };
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
-    can_use_partial_index, constraints_from_where_clause, partial_index,
-    partial_index_predicate_terms, Constraint,
+    add_implied_column_equalities, can_use_partial_index, constraints_from_where_clause,
+    partial_index, partial_index_predicate_terms, Constraint,
 };
 use cost::Cost;
 use join::{
@@ -2285,7 +2285,7 @@ fn optimize_table_access(
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &AvailableIndexes,
-    where_clause: &mut [WhereTerm],
+    where_clause: &mut Vec<WhereTerm>,
     order_by: &mut Vec<(
         Box<ast::Expr>,
         SortOrder,
@@ -2334,7 +2334,7 @@ fn find_table_access_plan(
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &AvailableIndexes,
-    where_clause: &mut [WhereTerm],
+    where_clause: &mut Vec<WhereTerm>,
     order_by: &mut Vec<(
         Box<ast::Expr>,
         SortOrder,
@@ -2493,6 +2493,17 @@ fn find_table_access_plan(
         if !outer_join_rewritten {
             break;
         }
+        constraints_per_table = constraints_from_where_clause(
+            where_clause,
+            table_references,
+            available_indexes,
+            subqueries,
+            schema,
+            params,
+        )?;
+    }
+
+    if add_implied_column_equalities(where_clause, table_references)? != 0 {
         constraints_per_table = constraints_from_where_clause(
             where_clause,
             table_references,

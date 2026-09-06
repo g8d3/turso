@@ -1506,6 +1506,17 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     continue;
                 }
 
+                if has_connected_legal_candidate(
+                    &lhs_mask,
+                    num_tables,
+                    &where_terms,
+                    required_lhs_by_table.as_deref(),
+                    left_join_illegal_map.as_ref(),
+                ) && !tables_are_connected(&lhs_mask, rhs_idx, &where_terms)
+                {
+                    continue;
+                }
+
                 // If this join ordering would violate LEFT JOIN ordering restrictions, skip.
                 if let Some(illegal_lhs) = left_join_illegal_map
                     .as_ref()
@@ -1708,6 +1719,50 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
             }
         }
     }
+}
+
+fn has_connected_legal_candidate(
+    prefix: &TableMask,
+    num_tables: usize,
+    where_terms: &[WhereTermInfo],
+    required_lhs_by_table: Option<&[TableMask]>,
+    left_join_illegal_map: Option<&HashMap<usize, TableMask>>,
+) -> bool {
+    (0..num_tables).any(|candidate| {
+        !prefix.get(candidate)
+            && can_add_table_to_prefix(
+                prefix,
+                candidate,
+                required_lhs_by_table,
+                left_join_illegal_map,
+            )
+            && tables_are_connected(prefix, candidate, where_terms)
+    })
+}
+
+fn can_add_table_to_prefix(
+    prefix: &TableMask,
+    candidate: usize,
+    required_lhs_by_table: Option<&[TableMask]>,
+    left_join_illegal_map: Option<&HashMap<usize, TableMask>>,
+) -> bool {
+    let has_required_tables = required_lhs_by_table
+        .and_then(|required| required.get(candidate))
+        .is_none_or(|required| prefix.contains_all_set_bits_of(required));
+    let keeps_outer_join_order = left_join_illegal_map
+        .and_then(|illegal| illegal.get(&candidate))
+        .is_none_or(|illegal| !prefix.intersects(illegal));
+    has_required_tables && keeps_outer_join_order
+}
+
+fn tables_are_connected(
+    prefix: &TableMask,
+    candidate: usize,
+    where_terms: &[WhereTermInfo],
+) -> bool {
+    where_terms
+        .iter()
+        .any(|term| term.table_mask.get(candidate) && term.table_mask.intersects(prefix))
 }
 
 /// Above this threshold, use greedy O(n²) ordering instead of exhaustive O(2^n) DP.
@@ -2568,6 +2623,116 @@ mod tests {
         let ready = ready_where_work(&outer_join_where, &where_terms, &joined_mask, 1, second_id);
         assert_eq!(ready.as_slice(), &[(0, where_terms[0].extra_steps)]);
         Ok(())
+    }
+
+    #[test]
+    fn connected_component_finishes_before_a_cross_join() -> Result<()> {
+        let where_terms = [0b0011_u128, 0b1100_u128].map(|mask| WhereTermInfo {
+            table_mask: TableMask::try_from(mask).unwrap(),
+            extra_steps: 0,
+            equal_tables: None,
+        });
+        let first_table = TableMask::try_from(0b0001_u128)?;
+
+        assert!(has_connected_legal_candidate(
+            &first_table,
+            4,
+            &where_terms,
+            None,
+            None,
+        ));
+        assert!(tables_are_connected(&first_table, 1, &where_terms));
+        assert!(!tables_are_connected(&first_table, 2, &where_terms));
+
+        let first_component = TableMask::try_from(0b0011_u128)?;
+        assert!(!has_connected_legal_candidate(
+            &first_component,
+            4,
+            &where_terms,
+            None,
+            None,
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn equality_class_connects_columns_through_a_third_table() -> Result<()> {
+        let (table_references, table_ids) =
+            equality_test_tables([Type::Integer, Type::Integer, Type::Integer]);
+        let mut where_clause = vec![
+            _create_binary_expr(
+                _create_column_expr(table_ids[0], 0, false),
+                Operator::Equals,
+                _create_column_expr(table_ids[1], 0, false),
+            ),
+            _create_binary_expr(
+                _create_column_expr(table_ids[1], 0, false),
+                Operator::Equals,
+                _create_column_expr(table_ids[2], 0, false),
+            ),
+        ];
+
+        let added = super::super::constraints::add_implied_column_equalities(
+            &mut where_clause,
+            &table_references,
+        )?;
+
+        assert_eq!(added, 1);
+        assert!(where_clause[2].consumed);
+        assert_eq!(
+            table_mask_from_expr(&where_clause[2].expr, &table_references, &[])?,
+            TableMask::try_from(0b101_u128)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn equality_class_does_not_cross_column_affinities() -> Result<()> {
+        let (table_references, table_ids) =
+            equality_test_tables([Type::Integer, Type::Integer, Type::Text]);
+        let mut where_clause = vec![
+            _create_binary_expr(
+                _create_column_expr(table_ids[0], 0, false),
+                Operator::Equals,
+                _create_column_expr(table_ids[1], 0, false),
+            ),
+            _create_binary_expr(
+                _create_column_expr(table_ids[1], 0, false),
+                Operator::Equals,
+                _create_column_expr(table_ids[2], 0, false),
+            ),
+        ];
+
+        let added = super::super::constraints::add_implied_column_equalities(
+            &mut where_clause,
+            &table_references,
+        )?;
+
+        assert_eq!(added, 0);
+        assert_eq!(where_clause.len(), 2);
+        Ok(())
+    }
+
+    fn equality_test_tables(column_types: [Type; 3]) -> (TableReferences, [TableInternalId; 3]) {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = column_types
+            .into_iter()
+            .enumerate()
+            .map(|(index, column_type)| {
+                _create_table_reference(
+                    _create_btree_table(
+                        &format!("table_{index}"),
+                        _create_column_list(&["key"], column_type),
+                    ),
+                    None,
+                    table_id_counter.next(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let table_ids =
+            std::array::from_fn(|index| table_references.joined_tables()[index].internal_id);
+        (table_references, table_ids)
     }
 
     #[test]
