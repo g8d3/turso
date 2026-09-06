@@ -30,6 +30,39 @@ The baseline used commit `b04d329547` and the analyzed benchmark databases.
 The other six graph queries provide guard coverage.
 Their baseline VM counts range from 1,060 to 289,758.
 
+### Full TPC-H work sweep
+
+This sweep used commit `0b61011880` after the first optimizer changes.
+It measured all 21 single-statement TPC-H query files.
+
+| Query | VM steps | Rows read |
+|---|---:|---:|
+| 1 | 204,236,651 | 6,001,215 |
+| 2 | 37,023,962 | 9,177,720 |
+| 3 | 12,482,022 | 2,087,813 |
+| 4 | 6,274,158 | 1,530,882 |
+| 5 | 12,448,655 | 1,898,579 |
+| 6 | 30,186,092 | 6,001,215 |
+| 7 | 77,004,157 | 9,512,865 |
+| 8 | 17,677,931 | 2,308,497 |
+| 9 | 58,996,167 | 6,649,413 |
+| 10 | 12,671,395 | 1,834,164 |
+| 11 | 8,060,382 | 1,621,704 |
+| 12 | 30,940,235 | 6,001,215 |
+| 13 | 55,776,321 | 1,800,000 |
+| 14 | 27,791,644 | 6,001,215 |
+| 16 | 7,829,268 | 803,084 |
+| 17 | 157,048,512 | 18,209,416 |
+| 18 | 75,230,762 | 6,001,287 |
+| 19 | 27,079,598 | 6,001,215 |
+| 20 | 37,804,191 | 7,159,641 |
+| 21 | 124,631,788 | 6,697,731 |
+| 22 | 18,967,954 | 1,800,000 |
+
+Query 15 contains three statements that create, read, and drop a view.
+The runner prepares one statement, so it cannot measure query 15 correctly.
+The sweep does not count query 15 as measured.
+
 ## Hypotheses
 
 ### Finish connected components first
@@ -79,12 +112,26 @@ An unavailable duplicate on one index column stopped the next usable column.
 The search now skips the unavailable duplicate.
 It only stops when a later index column creates a real prefix gap.
 
+### Replace a large automatic index with a hash join
+
+TPC-H 17 built an automatic index over 6 million `lineitem` rows.
+The filtered `part` input had an estimated 2,000 rows.
+
+The optimizer now compares a hash join with that automatic-index build.
+It keeps the index guard when the probe has a constant filter.
+This guard prevents the slower hash plan found for TPC-H 14.
+
+The TPC-H 17 result reduced VM steps from 157,048,512 to 113,333,747.
+Rows read fell from 18,209,416 to 12,208,396.
+Elapsed time fell from 85.21 seconds to 58.42 seconds.
+
 ## Final results
 
 | Query | Baseline VM | Final VM | VM change | Baseline rows | Final rows | Row change |
 |---|---:|---:|---:|---:|---:|---:|
 | TPC-H 5 | 19,424,408 | 12,447,165 | -35.9% | 3,555,780 | 1,898,579 | -46.6% |
 | TPC-H 9 | 58,993,989 | 58,993,419 | 0.0% | 6,649,413 | 6,649,413 | 0.0% |
+| TPC-H 17 | 157,048,512 | 113,333,747 | -27.8% | 18,209,416 | 12,208,396 | -33.0% |
 | Graph `a_cooccurrence` | 427,457 | 427,457 | 0.0% | 40,171 | 40,171 | 0.0% |
 | Graph `c_edge_counts` | 2,396,740 | 101,243 | -95.8% | 161,336 | 8,077 | -95.0% |
 
