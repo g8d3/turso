@@ -64,6 +64,9 @@ Query 15 contains three statements that create, read, and drop a view.
 The runner prepares one statement, so it cannot measure query 15 correctly.
 The sweep does not count query 15 as measured.
 
+A final release sweep measured the same 21 single-statement queries.
+It used the production 64 MB hash memory budget.
+
 ## Hypotheses
 
 ### Finish connected components first
@@ -180,6 +183,29 @@ Rows read fell from 6,500,065 to 4,485,662.
 B-tree seeks fell from 12,915,717 to 5,899,973.
 Elapsed time fell from 155.47 seconds to 57.50 seconds.
 
+### Use a hash anti-join for a large NOT EXISTS
+
+The release sweep found that TPC-H 22 was the slowest supported query.
+It built a temporary B-tree over 1.5 million `orders` rows.
+The query then made 1,519,031 index seeks.
+
+The new plan builds a hash table from the filtered `customer` rows.
+It scans `orders` once and marks matching customer rows.
+It then emits the customer rows that have no match.
+
+The implementation uses the existing outer hash join match bits.
+It also uses the existing spill path for large build inputs.
+Anti-join match filters do not run again when unmatched rows are emitted.
+
+Three release runs reduced mean time from 12.84 seconds to 0.54 seconds.
+This is a 95.8% reduction.
+VM steps fell from 18,964,160 to 16,489,945.
+Total B-tree seeks fell from 1,519,031 to 6,434.
+Both plans returned seven rows.
+
+Only TPC-H 22 changed across all 22 TPC-H plan files.
+All eight graph query plans stayed unchanged.
+
 ## Final results
 
 | Query | Baseline VM | Final VM | VM change | Baseline rows | Final rows | Row change |
@@ -189,6 +215,7 @@ Elapsed time fell from 155.47 seconds to 57.50 seconds.
 | TPC-H 17 | 157,048,512 | 113,333,747 | -27.8% | 18,209,416 | 12,208,396 | -33.0% |
 | TPC-H 20 | 109,156,541 | 118,489,525 | +8.5% | 30,916,254 | 31,123,606 | +0.7% |
 | TPC-H 21 | 124,631,788 | 41,034,425 | -67.1% | 6,697,731 | 4,485,662 | -33.0% |
+| TPC-H 22 | 18,964,160 | 16,489,945 | -13.0% | 1,800,000 | 1,819,031 | +1.1% |
 | Graph `a_cooccurrence` | 427,457 | 427,457 | 0.0% | 40,171 | 40,171 | 0.0% |
 | Graph `c_edge_counts` | 2,396,740 | 101,243 | -95.8% | 161,336 | 8,077 | -95.0% |
 
