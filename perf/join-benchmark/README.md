@@ -4,6 +4,10 @@ This tool measures query execution without printing result rows. It reports one 
 
 The records include elapsed time and stable work counters. Use the work counters before elapsed time when you compare optimizer changes.
 
+`btree_seeks` is the total seek count. `btree_table_seeks` and
+`btree_index_seeks` split that total by cursor type. `btree_deferred_seeks`
+counts table seeks that started after an index returned a row.
+
 Run the graph query set with analyzed statistics:
 
 ```bash
