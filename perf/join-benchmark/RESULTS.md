@@ -90,6 +90,23 @@ The implementation uses one representative column for each class.
 It adds missing links in a star shape.
 This shape avoids unnecessary links and unstable symmetric plans.
 
+### Do not infer links between rowid aliases
+
+CodSpeed found one repeated regression in the eight-table join-chain benchmark.
+The stable and nightly forms both took about six times longer.
+
+A local bisection found that implied equality links caused the regression.
+The links joined rowid aliases that already had a direct equality chain.
+Each direct rowid equality can produce at most one matching row.
+The extra links therefore added access candidates without reducing execution work.
+
+Skipping these links reduced local preparation time from 317 microseconds to 49 microseconds.
+Allocations fell from 3,441 to 471.
+The origin baseline took 41 microseconds and made 487 allocations.
+
+All 21 supported TPC-H plan shapes stayed unchanged.
+All eight graph plan shapes also stayed unchanged.
+
 ### Count constant filters inside compound lookups
 
 The `region` lookup used both its join key and `region.name`.
