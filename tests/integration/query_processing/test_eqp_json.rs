@@ -77,7 +77,7 @@ fn outer_join_null_test_estimates_unmatched_rows(tmp_db: TempDatabase) -> anyhow
         .unwrap()
         .iter()
         .filter_map(|node| node["op"]["estimate"]["output_rows"].as_f64())
-        .last()
+        .next_back()
         .unwrap();
     assert!(
         (80.0..99.0).contains(&estimated_rows),
