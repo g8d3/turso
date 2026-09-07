@@ -583,6 +583,7 @@ pub(super) fn add_implied_column_equalities(
         if representative == member
             || columns[representative].table == columns[member].table
             || direct_pairs.contains(&ordered_pair(representative, member))
+            || both_columns_are_rowid_aliases(&columns[representative].expr, &columns[member].expr)
         {
             continue;
         }
@@ -602,6 +603,19 @@ pub(super) fn add_implied_column_equalities(
     let inferred_count = inferred.len();
     where_clause.extend(inferred);
     Ok(inferred_count)
+}
+
+fn both_columns_are_rowid_aliases(left: &ast::Expr, right: &ast::Expr) -> bool {
+    let is_rowid_alias = |expr: &ast::Expr| {
+        matches!(
+            expr,
+            ast::Expr::Column {
+                is_rowid_alias: true,
+                ..
+            }
+        )
+    };
+    is_rowid_alias(left) && is_rowid_alias(right)
 }
 
 struct EqualColumn {

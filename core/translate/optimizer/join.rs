@@ -2793,6 +2793,47 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn equality_class_does_not_link_rowid_aliases() -> Result<()> {
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = (0..3)
+            .map(|index| {
+                _create_table_reference(
+                    _create_btree_table(
+                        &format!("table_{index}"),
+                        vec![_create_column_rowid_alias("id")],
+                    ),
+                    None,
+                    table_id_counter.next(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let table_ids: [TableInternalId; 3] =
+            std::array::from_fn(|index| table_references.joined_tables()[index].internal_id);
+        let mut where_clause = vec![
+            _create_binary_expr(
+                _create_column_expr(table_ids[0], 0, true),
+                Operator::Equals,
+                _create_column_expr(table_ids[1], 0, true),
+            ),
+            _create_binary_expr(
+                _create_column_expr(table_ids[1], 0, true),
+                Operator::Equals,
+                _create_column_expr(table_ids[2], 0, true),
+            ),
+        ];
+
+        let added = super::super::constraints::add_implied_column_equalities(
+            &mut where_clause,
+            &table_references,
+        )?;
+
+        assert_eq!(added, 0);
+        assert_eq!(where_clause.len(), 2);
+        Ok(())
+    }
+
     fn equality_test_tables(column_types: [Type; 3]) -> (TableReferences, [TableInternalId; 3]) {
         let mut table_id_counter = TableRefIdCounter::new();
         let joined_tables = column_types
