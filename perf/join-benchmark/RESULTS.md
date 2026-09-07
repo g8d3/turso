@@ -125,6 +125,32 @@ The TPC-H 17 result reduced VM steps from 157,048,512 to 113,333,747.
 Rows read fell from 18,209,416 to 12,208,396.
 Elapsed time fell from 85.21 seconds to 58.42 seconds.
 
+### Run correlated EXISTS filters after selective joins
+
+TPC-H 21 ran two correlated `EXISTS` filters after its first `lineitem` loop.
+The later `supplier` and `nation` joins rejected most of those rows.
+The old schedule still ran both filters for every earlier row.
+
+Removing both filters reduced VM work to 37,525,287 steps.
+The full query used 113,569,744 steps before this change.
+Swapping the filter order did not change the read counters.
+This result showed that both filters ran before either result was tested.
+
+A forced `lineitem`-first plan used 209,150,140 VM steps.
+That result rejected a join-order change.
+An early version also moved scalar subqueries.
+Exact parent comparisons found no gain and a small TPC-H 2 regression.
+
+The optimizer now moves a correlated `EXISTS` filter to the valid join prefix
+with the lowest estimated row count.
+It does not move a filter from an outer join condition.
+Scalar subqueries keep their old schedule.
+
+TPC-H 21 VM steps fell from 113,569,744 to 41,034,425.
+Rows read fell from 6,500,065 to 4,485,662.
+B-tree seeks fell from 12,915,717 to 5,899,973.
+Elapsed time fell from 155.47 seconds to 57.50 seconds.
+
 ## Final results
 
 | Query | Baseline VM | Final VM | VM change | Baseline rows | Final rows | Row change |
@@ -132,6 +158,7 @@ Elapsed time fell from 85.21 seconds to 58.42 seconds.
 | TPC-H 5 | 19,424,408 | 12,447,165 | -35.9% | 3,555,780 | 1,898,579 | -46.6% |
 | TPC-H 9 | 58,993,989 | 58,993,419 | 0.0% | 6,649,413 | 6,649,413 | 0.0% |
 | TPC-H 17 | 157,048,512 | 113,333,747 | -27.8% | 18,209,416 | 12,208,396 | -33.0% |
+| TPC-H 21 | 124,631,788 | 41,034,425 | -67.1% | 6,697,731 | 4,485,662 | -33.0% |
 | Graph `a_cooccurrence` | 427,457 | 427,457 | 0.0% | 40,171 | 40,171 | 0.0% |
 | Graph `c_edge_counts` | 2,396,740 | 101,243 | -95.8% | 161,336 | 8,077 | -95.0% |
 
