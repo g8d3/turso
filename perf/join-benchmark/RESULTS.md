@@ -1,7 +1,6 @@
 # Join optimizer study: 2026-09-06
 
-The broad query sweep uses debug builds.
-Final runtime checks use release builds and the production hash memory budget.
+Current runtime sweeps use release builds and the production hash memory budget.
 Execution work is the primary measure.
 Planning time is outside the study.
 
@@ -206,12 +205,59 @@ Both plans returned seven rows.
 Only TPC-H 22 changed across all 22 TPC-H plan files.
 All eight graph query plans stayed unchanged.
 
+### Hash an indexed prefix before an unfiltered probe
+
+The release sweep found that TPC-H 9 took the most time after the earlier changes.
+It scanned 6 million `lineitem` rows and made 7,654,290 B-tree seeks.
+
+A release profile collected 10,980 samples.
+The system spent 39.2% of the samples in `pread`.
+B-tree move and seek functions were the hottest Turso functions.
+
+The first test allowed every indexed build input to use a hash join.
+That rule made TPC-H 14 increase from 1.14 seconds to 4.50 seconds.
+It also made TPC-H 10, 5, and 7 slower.
+The results rejected the broad rule.
+
+The final rule requires an unfiltered probe input.
+It also keeps the earlier exception for an `IN` seek on the build input.
+This rule lets TPC-H 9 hash its filtered `part` and `partsupp` prefix.
+It then scans `lineitem` once and probes the hash table.
+
+Three release runs reduced mean time from 11.76 seconds to 2.75 seconds.
+This is a 76.6% reduction.
+B-tree seeks fell from 7,654,290 to 1,046,815.
+This is an 86.3% reduction.
+VM steps rose by 12.4% because each scanned row now probes the hash table.
+Both plans returned 175 rows.
+
+The final release sweep ran all 21 supported single-statement TPC-H queries.
+Only TPC-H 9 and 11 changed plan shape.
+TPC-H 11 changed by 0.65%, which is not a meaningful runtime change.
+All eight graph query plans stayed unchanged.
+
+### Estimate complete unique hash keys together
+
+The old model multiplied the estimates for each column in a composite hash key.
+That calculation treated related key columns as independent values.
+For TPC-H 9, it estimated less than one output row from 6 million probe rows.
+
+The new model detects a complete unique key on the hash build input.
+It divides the probe rows by the build table rows for that key.
+This estimate is still conservative for filtered data, but it is much closer.
+
+### Count the probe scan in hash join cost
+
+The old hash cost counted each hash probe but did not count the probe table scan.
+The new cost includes the scan pages and row work.
+This change did not alter any measured TPC-H or graph plan shape.
+
 ## Final results
 
 | Query | Baseline VM | Final VM | VM change | Baseline rows | Final rows | Row change |
 |---|---:|---:|---:|---:|---:|---:|
 | TPC-H 5 | 19,424,408 | 12,447,165 | -35.9% | 3,555,780 | 1,898,579 | -46.6% |
-| TPC-H 9 | 58,993,989 | 58,993,419 | 0.0% | 6,649,413 | 6,649,413 | 0.0% |
+| TPC-H 9 | 58,993,989 | 66,301,166 | +12.4% | 6,649,413 | 6,650,707 | +0.0% |
 | TPC-H 17 | 157,048,512 | 113,333,747 | -27.8% | 18,209,416 | 12,208,396 | -33.0% |
 | TPC-H 20 | 109,156,541 | 118,489,525 | +8.5% | 30,916,254 | 31,123,606 | +0.7% |
 | TPC-H 21 | 124,631,788 | 41,034,425 | -67.1% | 6,697,731 | 4,485,662 | -33.0% |
@@ -220,7 +266,7 @@ All eight graph query plans stayed unchanged.
 | Graph `c_edge_counts` | 2,396,740 | 101,243 | -95.8% | 161,336 | 8,077 | -95.0% |
 
 TPC-H 5 measured time fell from 26.37 seconds to 9.82 seconds.
-TPC-H 9 kept the same work and completed in 100.63 seconds.
+TPC-H 9 release time fell from 11.76 seconds to 2.75 seconds.
 TPC-H 20 release time fell from 6.18 seconds to 2.65 seconds.
 
 All other graph queries kept the same VM steps and rows read.
