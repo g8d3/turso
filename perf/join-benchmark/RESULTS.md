@@ -1,6 +1,7 @@
 # Join optimizer study: 2026-09-06
 
-This study uses debug builds because repository rules prohibit release builds.
+The broad query sweep uses debug builds.
+Final runtime checks use release builds and the production hash memory budget.
 Execution work is the primary measure.
 Planning time is outside the study.
 
@@ -55,7 +56,7 @@ It measured all 21 single-statement TPC-H query files.
 | 17 | 157,048,512 | 18,209,416 |
 | 18 | 75,230,762 | 6,001,287 |
 | 19 | 27,079,598 | 6,001,215 |
-| 20 | 37,804,191 | 7,159,641 |
+| 20 | 109,156,533 | 30,916,254 |
 | 21 | 124,631,788 | 6,697,731 |
 | 22 | 18,967,954 | 1,800,000 |
 
@@ -125,6 +126,34 @@ The TPC-H 17 result reduced VM steps from 157,048,512 to 113,333,747.
 Rows read fell from 18,209,416 to 12,208,396.
 Elapsed time fell from 85.21 seconds to 58.42 seconds.
 
+### Materialize an IN-driven hash build
+
+TPC-H 20 built a temporary B-tree over 6 million `lineitem` rows.
+The outer `partsupp` read used an `IN` seek and produced about 894 estimated rows.
+
+A global grouped table used 51,024,156 VM steps in an isolated query.
+That form can run `sum` for unused keys and expose an overflow that the source query avoids.
+The result rejected a general group-first rewrite.
+
+A general hash rule changed TPC-H 14 from 27,791,557 to 103,693,634 VM steps.
+Elapsed time rose from 14.78 seconds to 134.55 seconds.
+The final rule keeps that guard.
+It only considers this hash form when an `IN` seek filters the build input.
+
+The optimizer now stores the selected build rows before it builds the hash table.
+It stores the join keys and payload together.
+This avoids a base-table seek for each hash match.
+
+Release builds use the production 64 MB hash budget.
+Three measured runs reduced mean elapsed time from 6.18 seconds to 2.65 seconds.
+This is a 57.1% reduction.
+Mean VM steps rose from 109,156,541 to 118,489,525.
+B-tree seeks fell from 938,602 to 39,997.
+Both plans returned 184 rows.
+
+The change affected only query 20 across all 22 TPC-H plan files.
+All eight graph query plans stayed unchanged.
+
 ### Run correlated EXISTS filters after selective joins
 
 TPC-H 21 ran two correlated `EXISTS` filters after its first `lineitem` loop.
@@ -158,12 +187,14 @@ Elapsed time fell from 155.47 seconds to 57.50 seconds.
 | TPC-H 5 | 19,424,408 | 12,447,165 | -35.9% | 3,555,780 | 1,898,579 | -46.6% |
 | TPC-H 9 | 58,993,989 | 58,993,419 | 0.0% | 6,649,413 | 6,649,413 | 0.0% |
 | TPC-H 17 | 157,048,512 | 113,333,747 | -27.8% | 18,209,416 | 12,208,396 | -33.0% |
+| TPC-H 20 | 109,156,541 | 118,489,525 | +8.5% | 30,916,254 | 31,123,606 | +0.7% |
 | TPC-H 21 | 124,631,788 | 41,034,425 | -67.1% | 6,697,731 | 4,485,662 | -33.0% |
 | Graph `a_cooccurrence` | 427,457 | 427,457 | 0.0% | 40,171 | 40,171 | 0.0% |
 | Graph `c_edge_counts` | 2,396,740 | 101,243 | -95.8% | 161,336 | 8,077 | -95.0% |
 
 TPC-H 5 measured time fell from 26.37 seconds to 9.82 seconds.
 TPC-H 9 kept the same work and completed in 100.63 seconds.
+TPC-H 20 release time fell from 6.18 seconds to 2.65 seconds.
 
 All other graph queries kept the same VM steps and rows read.
 The graph suite found no deterministic work regression.
@@ -173,7 +204,7 @@ The graph suite found no deterministic work regression.
 Print plans:
 
 ```bash
-cargo run -p turso-join-benchmark -- \
+cargo run --release -p turso-join-benchmark -- \
   --database perf/tpc-h/TPC-H.db \
   --query-dir perf/tpc-h/queries \
   --query 5 --query 9 --plans
@@ -182,7 +213,7 @@ cargo run -p turso-join-benchmark -- \
 Measure TPC-H execution:
 
 ```bash
-cargo run -p turso-join-benchmark -- \
+cargo run --release -p turso-join-benchmark -- \
   --database perf/tpc-h/TPC-H.db \
   --query-dir perf/tpc-h/queries \
   --query 5 --query 9 \
@@ -193,7 +224,7 @@ cargo run -p turso-join-benchmark -- \
 Measure the analyzed graph suite:
 
 ```bash
-cargo run -p turso-join-benchmark -- \
+cargo run --release -p turso-join-benchmark -- \
   --database perf/graph-queries/graph-queries-analyzed.db \
   --query-dir perf/graph-queries/queries \
   --warmups 1 --repetitions 3
