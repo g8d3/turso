@@ -1,175 +1,146 @@
-# PR2 prep — full ptrmap coverage for autovacuum databases
+# PROTOTYPE NOTES — full ptrmap coverage for autovacuum DBs (PR2 prep)
 
-Branch `bounty/ptrmap-full-coverage` (built on `main` @ `cca14b3f`, **local only**,
-no push, no PR). Companion to PR #8812 (freelist-side `FreePage` entries +
-`database_size` persistence) — this work deliberately does **not** duplicate that
-scope; the two are complementary and a full integrity-check pass needs both.
+Branch `bounty/ptrmap-full-coverage` (local only — never push, never open PRs).
+Goal: a multi-table `auto_vacuum=full` DB passes stock SQLite `PRAGMA
+integrity_check`. Builds on `main` (`cca14b3f`); deliberately does NOT duplicate
+the freelist-side fixes of open PR #8812.
 
-Goal: a multi-table `auto_vacuum=full` database built by turso passes stock
-SQLite `PRAGMA integrity_check` on the pointer-map side (issue #6774; prior art
-#3894/#6193).
+Provenance note: this working state was resumed mid-flight after a prior agent
+session stalled; its uncommitted tree changes were recovered from this
+workspace's git stash (`git stash show -p`) plus this session's additions
+(stale-buffer clears at fresh-balance entry points) and committed together.
 
-## Design implemented
+## Design (as implemented)
 
-Choke points, following the settled design:
+Single choke points, buffer-then-drain everywhere blocking IO is possible, every
+drain point re-entrant. All code is `#[cfg(feature = "autovacuum")]` AND
+runtime-gated on `AutoVacuumMode::Full` (`ptrmap_put` must never run on
+non-autovacuum DBs).
 
-1. **Overflow chains — `fill_cell_payload` (`core/storage/btree.rs`).** The
-   single place overflow pages get allocated for real callers (`WriteState::Insert`
-   and `OverwriteCellState::FillPayload`; `#[cfg(test)]` callers use the same
-   state machine and stay compatible).
+### 1. Overflow chains — `fill_cell_payload` (core/storage/btree.rs)
 
-   - `FillCellPayloadState::CopyData` gained a `pending_ptrmap:
-     Vec<(u32, PtrmapType, u32)>` buffer (behind `#[cfg(feature = "autovacuum")]`).
-   - In the `CopyDataState::AllocateOverflowPage` arm, when the pager is in
-     `AutoVacuumMode::Full`, linking a new overflow page pushes
-     `(new_page_id, Overflow2, previous_overflow_page)` when the chain has a
-     predecessor, else `(new_page_id, Overflow1, btree_page_holding_the_cell)`.
-     This matches SQLite's ptrmap semantics (btree.c `ptrmapPutOvflPtr`).
-   - When the payload copy completes, the state transitions to
-     `FillCellPayloadState::WritePtrmap { entries, idx }` instead of returning
-     `Done`. That arm drains the buffer via
-     `return_if_io!(pager.ptrmap_put(..))`, advancing the persisted `idx` only
-     after each put completes. On IO yield the state is re-entered unchanged,
-     the same entry is re-issued, and `Pager::ptrmap_put` resumes via its own
-     persisted `PtrMapPutState`; overwrite semantics make the retry idempotent.
-     The buffer lives entirely inside the persisted state enum, so re-entry
-     across yields neither loses nor duplicates entries.
+`fill_cell_payload` is the single place overflow pages are allocated (real
+callers: `WriteState::Insert` and `OverwriteCellState::FillPayload`; other
+callers are `#[cfg(test)]` via `run_until_done`, which drives the same
+persistent state machine, so they are compatible).
 
-2. **B-tree page entries + reparenting — balance paths.** Every non-root btree
-   page needs a `(BTreeNode, parent)` entry, and pages referenced by cells that
-   move between pages need their entries re-asserted (both `BTreeNode` parents
-   of children and `Overflow1` parents of moved cells).
+- `FillCellPayloadState::CopyData` gained `pending_ptrmap:
+  Vec<(u32, PtrmapType, u32)>` (buffer lives in the persisted enum, so re-entry
+  across IO yields neither loses nor duplicates entries).
+- In the `AllocateOverflowPage` arm, after linking a new overflow page:
+  `(page, Overflow1, btree_page)` for the first page of a chain, or
+  `(page, Overflow2, prev_overflow_page)` for later pages. Pure push, no IO.
+- When the copy completes, instead of returning `Done` the state transitions to
+  `WritePtrmap { entries, idx }`, which drains via
+  `return_if_io!(pager.ptrmap_put(..))`, advancing the persisted `idx` only
+  after each put completes. Re-entering re-issues the in-flight entry; the put
+  resumes via the pager's own `PtrMapPutState` and rewrites the same bytes
+  (idempotent). No overflow allocation can ever re-run after a ptrmap yield
+  (no double allocation).
+- If balancing later moves the cell, the overflow entries are re-asserted by
+  the balance-side walks below (later writes win; drain order = push order).
 
-   - A pure-memory helper `queue_page_ptrmap_refs(page, usable_space, out)`
-     walks a loaded page and buffers: each cell's left child (and the
-     rightmost pointer for interior pages) as `(BTreeNode, page)`, each
-     overflowing cell's first overflow page as `(Overflow1, page)`, and the
-     same for deferred cells held in `overflow_cells` (full cell images parsed
-     by `queue_cell_image_ptrmap_refs` — covers the unmaterialized divider
-     cells and the cell `balance_quick` moves).
-   - **Buffer, don't block:** the previous prototype's unresolved problem was
-     blocking-IO placement inside non-reentrant balance states. Resolved by
-     buffering entries into `BalanceState::pending_ptrmap` (all pushes are
-     memory-only) and draining them in a new re-entrant
-     `BalanceSubState::WritePtrmap { idx }` state at the **single completion
-     point of `balance()`** (the `Start` arm's `return Done`, gated on
-     `AutoVacuumMode::Full` and a non-empty buffer). `balance_root`,
-     `balance_quick`, and `balance_nonroot` all funnel through that exit, so
-     no blocking IO was added to any state that would redo work on re-entry.
-   - Hook points:
-     - `balance_root`: the fresh child (old root content) gets
-       `(BTreeNode, root)` plus a walk of its references; the root itself
-       keeps no entry (root pages are referenced only by the schema page;
-       `PTRMAP_ROOTPAGE` entries only arise from vacuum relocation, out of
-       scope).
-     - `balance_quick` (append fast-path): the new rightmost leaf gets
-       `(BTreeNode, parent)` plus a walk (the moved overflow cell may carry an
-       `Overflow1` chain that now hangs off the new leaf).
-     - `balance_nonroot` `NonRootDoBalancingFinish`: after page-number
-       reassignment (so entries use final ids), after divider insertion and
-       cell movement, and after the balance-shallower fold (the absorbed
-       sibling is skipped — `sibling_count_new` is already decremented): each
-       surviving sibling gets `(BTreeNode, parent)` plus a walk; then the
-       parent is walked, which re-asserts entries for children moved between
-       siblings, promoted divider cells and their overflow chains. Duplicate
-       entries are harmless: `ptrmap_put` overwrites in place, and the walk
-       ordering guarantees the last write reflects the final structure.
+### 2. B-tree node entries + reparenting — balance paths
 
-   This mirrors SQLite's `reparentChildPages` approach in `balance_nonroot`.
+Every non-root b-tree page needs `(BTreeNode, parent)`. Pages are first linked
+in exactly three places, plus cells/children move during balancing:
 
-## IO-placement decisions (the part this design had to settle)
+- `balance_root` (root split): the fresh child gets `(BTreeNode, root)`, then
+  `queue_page_ptrmap_refs(child)` re-asserts the child's references (their
+  parent changed from root to child, including first-overflow parents of moved
+  cells).
+- `balance_quick` (append fast-path): the fresh rightmost leaf gets
+  `(BTreeNode, parent)`, then `queue_page_ptrmap_refs(new_leaf)` re-asserts the
+  moved overflow cell's chain with the leaf as `Overflow1` parent.
+- `balance_nonroot` (`NonRootDoBalancingFinish`), AFTER the page-number
+  reassignment so ids are final: every surviving sibling page gets its own
+  `(BTreeNode, parent)` self-entry plus `queue_page_ptrmap_refs(page)`
+  (children, rightmost pointer, and `Overflow1` parents of cells that landed on
+  it); finally `queue_page_ptrmap_refs(parent)` re-asserts divider-cell
+  overflow chains now hanging off the parent and, in the balance-shallower
+  case, the children absorbed by the root.
 
-- **Why buffer+flush instead of inline `ptrmap_put` in balance states:**
-  `balance_root`/`balance_quick` restart from their top on yield (their only
-  IO — `do_allocate_page` — is at the top), so any `return_if_io!` placed
-  after their mutations would re-run allocations and duplicate structural
-  work. `balance_nonroot`'s `NonRootDoBalancingFinish` is likewise not
-  re-entrant mid-body. The only re-entrant point is the `balance()` driver's
-  `Start` arm, so that is where the drain state lives. Cost: entries are
-  written after the structural work instead of interleaved — irrelevant for
-  correctness because ptrmap entries are absolute overwrites and nothing reads
-  them mid-balance.
-- **fill_cell_payload drains its own entries before returning Done**, so the
-  pager's single shared `ptrmap_put_state` is never used by two logical puts
-  at once within one write operation (fill → insert → balance are strictly
-  sequential on one cursor).
+`queue_page_ptrmap_refs` is a pure walk over the already-loaded, dirty page
+buffer (parses cells via `cell_get_raw_region` + `read_btree_cell`); it emits
+`(BTreeNode, page)` for each direct child and `(Overflow1, page)` for each
+cell-overflow chain start. Rewriting an unchanged entry is a harmless idempotent
+overwrite; leaves produce no child entries.
 
-## Guards
+Correctness notes:
+- The reassignment block permutes page ids only among pages that all require
+  the identical entry `(BTreeNode, parent)`, so old entries stay correct;
+  genuinely new pages (possibly freelist-reused ids with stale entries) get
+  overwritten by their self-entry.
+- Divider cells deferred into the parent's `overflow_cells` are not walked by
+  the parent pass, but they can never terminate a balance: any level with
+  overflow cells is not "already balanced", so the next balancing round
+  collects them and the page they land on re-asserts their chains.
+- Balance-shallower: the absorbed page's own entry is simply not re-queued;
+  with PR #8812 its free will write the `FreePage` entry.
 
-- All new state fields/arms/helpers are behind
-  `#[cfg(feature = "autovacuum")]`; the variant `BalanceSubState::WritePtrmap`
-  itself is unconditional (with a `#[cfg(not(...))]` no-op transition in the
-  driver) to avoid cfg-gating every match arm.
-- Every push/drain is additionally gated at runtime on
-  `pager.get_auto_vacuum_mode() == AutoVacuumMode::Full`, so non-autovacuum
-  databases never touch `ptrmap_put`.
+### 3. IO placement (the resolved design question)
 
-## Compile status
+Blocking IO (`ptrmap_put` → `read_page`) happens in exactly two states, both
+re-entrant by construction:
 
-- `cargo check -p turso_core` (default features, includes `autovacuum`):
-  **clean**; `cargo fmt --check`: clean; clippy shows no findings in
-  `btree.rs`.
-- `cargo check -p turso_core --no-default-features`: fails, but identically
-  to pristine `main` (verified by stashing: same 8 errors, all in
-  `incremental/dbsp.rs` — unresolved `uuid` — and `vdbe/execute.rs`). The
-  baseline feature-combination build is broken on main independent of this
-  change; zero errors/warnings originate from `btree.rs` in any configuration.
+1. `FillCellPayloadState::WritePtrmap` — after all payload copying is done; the
+   copy/allocation loop can never be re-entered.
+2. `BalanceSubState::WritePtrmap { idx }` — a dedicated state in the
+   `balance()` driver, reached only at balance()'s single completion point
+   (the `Start` arm's "already balanced" exit), after all structural work.
+   The structural states (`NonRootDoBalancing*`, `FreePages`) are not
+   re-entrant (a yield inside would redo allocations), which is why the
+   previous prototype's blocking-IO placement was unresolved: it is resolved
+   here by never putting blocking IO inside them — only pure buffer pushes.
+   On IO, `balance()` re-enters `WritePtrmap` directly with the persisted
+   `idx` (the balanced-check is pure and re-runnable, the stack is stable
+   during the drain).
 
-## What is validated vs NOT (honest)
+Stale-buffer hygiene: entries buffered by an aborted balance (IO error path)
+are dropped at the three fresh-balance construction sites (`WriteState::Insert`
+balancing transition, overwrite transition, `DeleteState::Balancing`), so a
+later balance can never flush entries from an earlier, aborted one.
+
+## Validation status (honest)
 
 Validated:
+- `cargo check -p turso_core` clean (default features include `autovacuum`, so
+  all new code is compiled and exercised).
+- `cargo fmt --check` clean (CI's cargo-fmt-check).
+- `cargo check -p turso_core --no-default-features` produces exactly the same
+  15 pre-existing errors as `main` (`uuid`, io/encryption-gated modules; none
+  in `btree.rs`/`pager.rs`) — that feature combination is broken on `main`
+  already; this change adds zero new errors there.
+- Design-level yield-safety reasoning above (state persisted in enums,
+  idempotent retries, single re-entrant drain points).
 
-- Compiles clean (default config), fmt-clean, no clippy findings in the
-  touched file; `--no-default-features` delta-vs-main is zero.
-- The state machines are yield-safe by construction (buffers live in the
-  persisted enums; drain indices only advance on completed puts; retries are
-  idempotent overwrites) — by reasoning, not by crash-injection tests.
-
-NOT validated (prototype hand-off to maintainer feedback):
-
-- **No runtime test was run**: no `auto_vacuum=full` end-to-end scenario, no
-  stock-SQLite `PRAGMA integrity_check` comparison, no simulator run. The
-  prior prototype's signal (churn scenarios went from 101/8 integrity errors
-  to `ok` on 3 of 4) applies to the same approach but not to this exact code.
-- Freelist-side `FreePage` entries are intentionally absent (PR #8812's
-  scope). Until combined with it, integrity checks on DBs with deleted pages
-  will still report freelist ptrmap errors — expected.
-- `PTRMAP_ROOTPAGE` entries (root relocation during vacuum) are out of scope.
-- Known residual risks, documented for the maintainer discussion:
-  - `Pager::ptrmap_put` state is a single shared slot; two cursors on the same
-    pager whose write operations interleave across IO yields could trample
-    each other's in-flight put. Same exposure pattern as PR #8812's
-    `free_page` ptrmap write; within one cursor's sequential phases it cannot
-    happen.
-  - If a cursor is dropped mid-balance or an error aborts a balance, buffered
-    entries are lost (page structure itself is also partially mutated in that
-    case — pre-existing behavior class, not worsened here).
-  - Perf: every balance in `auto_vacuum=full` now parses all cells of each
-    balanced page and writes a handful of ptrmap entries (ptrmap pages are
-    hot in cache; entries collapse onto few pages). Not benchmarked.
+NOT validated (explicitly):
+- NO runtime test was executed: no DB was created, no `PRAGMA integrity_check`
+  was run. This is compile-checked, design-reviewed prototype state, not a
+  green-lighted fix. (An earlier ~270-line prototype from session history with
+  equivalent coverage turned 101/8 integrity errors into `ok` on 3 of 4
+  multi-table churn scenarios — evidence the approach works, but not evidence
+  THIS code passes.)
+- Freelist-side gaps remain by design (PR #8812 covers `FreePage` entries in
+  `free_page` + the database-size persistence fix): stock SQLite
+  integrity_check will still report `Freelist: Failed to read ptrmap key=N`
+  for freed pages until #8812 lands. The two PRs are complementary.
+- `VACUUM` / incremental-vacuum page-relocation paths untouched.
+- No fuzz/simulator exposure.
 
 ## Suggested validation plan (when maintainer feedback arrives)
 
-1. Port the prior session's scenario harness: create DB with
-   `PRAGMA page_size=512; PRAGMA auto_vacuum=FULL;`, 3+ tables, mixed
-   insert/delete churn past several ptrmap boundaries, big blobs to force
-   overflow chains and balances (including appends that hit `balance_quick`).
-2. Compare against stock SQLite: open the file read-only, run
-   `PRAGMA integrity_check`, assert `ok` once #8812 + this change are
-   combined; without the BTreeNode/Overflow work it reports
-   `Failed to read ptrmap key=N`.
-3. Crash/yield injection: run the same scenarios with the injected-yield
-   feature (`io_memory_yield` / simulator) to exercise re-entry through
-   `FillCellPayloadState::WritePtrmap` and `BalanceSubState::WritePtrmap`.
-4. Regression-test the non-autovacuum path (default mode) to confirm the
-   runtime guard keeps ptrmap_put unreachable.
-
-## Concurrency note (process, not code)
-
-While this session was implementing, a concurrent agent session in this same
-worktree applied `cargo fmt` and extended `queue_page_ptrmap_refs` with
-deferred-`overflow_cells` coverage (`queue_cell_image_ptrmap_refs`). That
-addition closes a real gap (unmaterialized cells during balancing) and was
-absorbed and compile-verified rather than reverted. The final committed tree
-is the merged result; anything that writer lands afterwards is theirs and
-layers on top via git.
+1. Port the repro harness from PR #8812's tests (page_size=512; ptrmap pages
+   at 2, 105, ...): create a DB with `auto_vacuum=full`, several tables,
+   oversized rows (multi-page overflow chains), interleaved inserts/deletes to
+   force splits, rebalances, balance_quick appends and balance-shallower
+   shrinks; then `PRAGMA integrity_check` via stock SQLite CLI.
+2. Assertion set: zero `Failed to read ptrmap key=N` errors for live (non-
+   freelist) pages; `integrity_check` = `ok` once #8812's FreePage entries are
+   also present; spot-check `ptrmap_get` parent/type for pages involved in a
+   forced `balance_nonroot` (log page ids).
+3. Yield coverage: run the same scenario through the injected-yield test
+   harness (`injected_yields`) and under the async path so every
+   `return_if_io!` edge in the two `WritePtrmap` states is actually hit;
+   assert no duplicated/lost entries (entry count per page id).
+4. Simulator: enable autovacuum in a simulator scenario for a soak run.
