@@ -71,10 +71,13 @@ Correctness notes:
   the identical entry `(BTreeNode, parent)`, so old entries stay correct;
   genuinely new pages (possibly freelist-reused ids with stale entries) get
   overwritten by their self-entry.
-- Divider cells deferred into the parent's `overflow_cells` are not walked by
-  the parent pass, but they can never terminate a balance: any level with
-  overflow cells is not "already balanced", so the next balancing round
-  collects them and the page they land on re-asserts their chains.
+- Cells deferred into a page's `overflow_cells` ARE walked: large divider
+  cells in the parent and the cell `balance_quick` moves into the fresh leaf
+  stay as full cell images there (an oversized cell does not fit even an
+  empty page), so no later balancing round is guaranteed to re-assert them.
+  `queue_page_ptrmap_refs` parses those images via
+  `queue_cell_image_ptrmap_refs` (same layout rules as `read_btree_cell`) and
+  re-asserts their left-child and first-overflow entries immediately.
 - Balance-shallower: the absorbed page's own entry is simply not re-queued;
   with PR #8812 its free will write the `FreePage` entry.
 
