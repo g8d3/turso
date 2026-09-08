@@ -113,23 +113,49 @@ Validated:
 - `cargo check -p turso_core --no-default-features` produces exactly the same
   15 pre-existing errors as `main` (`uuid`, io/encryption-gated modules; none
   in `btree.rs`/`pager.rs`) — that feature combination is broken on `main`
-  already; this change adds zero new errors there.
+  already; this change adds zero new errors there. Additionally compiled with
+  all default features except `autovacuum` (no warnings after cfg fixes).
 - Design-level yield-safety reasoning above (state persisted in enums,
   idempotent retries, single re-entrant drain points).
 
-NOT validated (explicitly):
-- NO runtime test was executed: no DB was created, no `PRAGMA integrity_check`
-  was run. This is compile-checked, design-reviewed prototype state, not a
-  green-lighted fix. (An earlier ~270-line prototype from session history with
-  equivalent coverage turned 101/8 integrity errors into `ok` on 3 of 4
-  multi-table churn scenarios — evidence the approach works, but not evidence
-  THIS code passes.)
-- Freelist-side gaps remain by design (PR #8812 covers `FreePage` entries in
-  `free_page` + the database-size persistence fix): stock SQLite
-  integrity_check will still report `Freelist: Failed to read ptrmap key=N`
-  for freed pages until #8812 lands. The two PRs are complementary.
-- `VACUUM` / incremental-vacuum page-relocation paths untouched.
-- No fuzz/simulator exposure.
+## Runtime validation (executed after the commits above)
+
+Debug CLI (`tursodb --experimental-autovacuum`), `page_size=512`, generated
+SQL workloads, verified with stock `sqlite3` 3.45.1 `PRAGMA integrity_check`:
+
+| Scenario | Coverage exercised | Result |
+|---|---|---|
+| pure grow: 2 tables + 1 index, 1500 rows, payloads up to 9 KB, 19,260 pages | fill_cell_payload chains, root splits, quick + non-root balances, ptrmap-page allocation | **`ok`** |
+| table-only churn: bulk DELETE + freelist-reusing INSERT (no index) | balance frees, page renumbering, freelist reuse | **`ok`** (stacked with #8812) |
+| churn without #8812 (updates + deletes + inserts, index present) | same | 100 errors, **all** `Freelist: ... ptr map` = #8812's scope, zero BTreeNode/Overflow coverage errors |
+| index churn stacked with #8812: updates-only and deletes-only runs | index-page balancing, chain re-parenting | **FAILS**: 12–14 `Bad ptr map entry ... expected=(3,P_new) got=(3,P_old)` |
+
+## Residual bug found by validation (PR-blocking)
+
+All failing entries are `PTRMAP_OVERFLOW1` with a **stale parent**: an index
+divider cell whose payload spills to overflow moved from page P_old to P_new
+without its chain's first-overflow entry being re-asserted (e.g. key 4975
+expected `(Overflow1, 14972)` got `(Overflow1, 9646)`). Repro: grow DB with an
+index, then either ~200 UPDATEs or ~215 DELETEs (`id % 7 = 3`) — both
+reproduce; table-only trees are clean; pure grow is clean.
+
+Prime suspect: the interior-node-replacement write path (index inserts that
+overwrite an equal key, and `DeleteState::InteriorNodeReplacement`) copies a
+cell — together with its overflow chain — into a different page, and when the
+destination does not overflow, no balance runs, so no `queue_page_ptrmap_refs`
+walk ever re-asserts the chain entry. Both paths fall outside the covered set
+(fill_cell_payload, balance_root/quick/nonroot).
+
+Fix sketch (not implemented — needs its own careful pass): after an interior
+cell replacement completes without a balance, queue `Overflow1` entries for
+the destination page's cells (and any child re-homing) into `pending_ptrmap`,
+plus a drain state in the insert/delete state machines so the entries flush
+even when no balance follows. Until this lands, the branch must NOT be
+submitted: index-tree churn produces files stock SQLite flags as corrupt.
+
+Still not exercised: injected-yield (`injected_yields`) coverage of the new
+drain states under spilling, VACUUM/incremental-vacuum relocation, fuzz/
+simulator exposure.
 
 ## Suggested validation plan (when maintainer feedback arrives)
 
